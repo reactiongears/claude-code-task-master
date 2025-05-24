@@ -29,6 +29,7 @@ import {
 	updateTaskById,
 	updateSubtaskById,
 	removeTask,
+	moveTask,
 	findTaskById,
 	taskExists
 } from './task-manager.js';
@@ -507,6 +508,10 @@ function registerCommands(programInstance) {
 			'--append',
 			'Append new tasks to existing tasks.json instead of overwriting'
 		)
+		.option(
+			'-r, --research',
+			'Use Perplexity AI for research-backed task generation, providing more comprehensive and accurate task breakdown'
+		)
 		.action(async (file, options) => {
 			// Use input option if file argument not provided
 			const inputFile = file || options.input;
@@ -515,6 +520,7 @@ function registerCommands(programInstance) {
 			const outputPath = options.output;
 			const force = options.force || false;
 			const append = options.append || false;
+			const research = options.research || false;
 			let useForce = force;
 			let useAppend = append;
 
@@ -547,7 +553,8 @@ function registerCommands(programInstance) {
 						spinner = ora('Parsing PRD and generating tasks...\n').start();
 						await parsePRD(defaultPrdPath, outputPath, numTasks, {
 							append: useAppend, // Changed key from useAppend to append
-							force: useForce // Changed key from useForce to force
+							force: useForce, // Changed key from useForce to force
+							research: research
 						});
 						spinner.succeed('Tasks generated successfully!');
 						return;
@@ -609,7 +616,8 @@ function registerCommands(programInstance) {
 				spinner = ora('Parsing PRD and generating tasks...\n').start();
 				await parsePRD(inputFile, outputPath, numTasks, {
 					append: useAppend,
-					force: useForce
+					force: useForce,
+					research: research
 				});
 				spinner.succeed('Tasks generated successfully!');
 			} catch (error) {
@@ -2092,6 +2100,37 @@ function registerCommands(programInstance) {
 				console.error(
 					chalk.red(`Error: ${error.message || 'An unknown error occurred'}`)
 				);
+				process.exit(1);
+			}
+		});
+
+	// move command
+	programInstance
+		.command('move')
+		.description('Move a task to a new position in the task list')
+		.option('-i, --id <id>', 'Task ID to move (required)')
+		.option('-p, --position <position>', 'New position (1-based index) (required)')
+		.option('-f, --file <file>', 'Path to the tasks file', 'tasks/tasks.json')
+		.action(async (options) => {
+			const tasksPath = options.file;
+			const taskId = options.id;
+			const newPosition = parseInt(options.position, 10);
+
+			if (!taskId) {
+				console.error(chalk.red('Error: Task ID is required (--id)'));
+				process.exit(1);
+			}
+
+			if (!newPosition || isNaN(newPosition) || newPosition < 1) {
+				console.error(chalk.red('Error: Valid position is required (--position, must be >= 1)'));
+				process.exit(1);
+			}
+
+			try {
+				await moveTask(tasksPath, taskId, newPosition);
+				console.log(chalk.green(`✓ Task ${taskId} moved to position ${newPosition}`));
+			} catch (error) {
+				console.error(chalk.red(`Error moving task: ${error.message}`));
 				process.exit(1);
 			}
 		});

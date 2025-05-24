@@ -50,6 +50,7 @@ const prdResponseSchema = z.object({
  * @param {Object} options - Additional options
  * @param {boolean} [options.force=false] - Whether to overwrite existing tasks.json.
  * @param {boolean} [options.append=false] - Append to existing tasks file.
+ * @param {boolean} [options.research=false] - Use research model for enhanced PRD analysis.
  * @param {Object} [options.reportProgress] - Function to report progress (optional, likely unused).
  * @param {Object} [options.mcpLog] - MCP logger object (optional).
  * @param {Object} [options.session] - Session object from MCP server (optional).
@@ -63,7 +64,8 @@ async function parsePRD(prdPath, tasksPath, numTasks, options = {}) {
 		session,
 		projectRoot,
 		force = false,
-		append = false
+		append = false,
+		research = false
 	} = options;
 	const isMCP = !!mcpLog;
 	const outputFormat = isMCP ? 'json' : 'text';
@@ -90,23 +92,9 @@ async function parsePRD(prdPath, tasksPath, numTasks, options = {}) {
 		}
 	};
 
-	// Check if we should auto-enable append mode for claude-code provider
-	const currentProvider = getMainProvider(projectRoot);
-	const isClaudeCode = currentProvider === 'claude-code';
-	let useAppend = append;
-	let useForce = force;
-	let tasksPerBatch = numTasks; // Start with the requested number of tasks
-	
-	if (isClaudeCode && numTasks >= 10 && !append && !force) {
-		report(
-			`Detected claude-code provider with ${numTasks} tasks. Auto-enabling batch mode with append.`,
-			'info'
-		);
-		useAppend = true;
-		tasksPerBatch = Math.min(6, numTasks); // Generate max 6 tasks per batch for claude-code
-	}
-
-	report(`Parsing PRD file: ${prdPath}, Force: ${useForce}, Append: ${useAppend}, Tasks per batch: ${tasksPerBatch}`);
+	report(
+		`Parsing PRD file: ${prdPath}, Force: ${force}, Append: ${append}, Research: ${research}`
+	);
 
 	let existingTasks = [];
 	let nextId = 1;
@@ -115,7 +103,7 @@ async function parsePRD(prdPath, tasksPath, numTasks, options = {}) {
 	try {
 		// Handle file existence and overwrite/append logic
 		if (fs.existsSync(tasksPath)) {
-			if (useAppend) {
+			if (append) {
 				report(
 					`Append mode enabled. Reading existing tasks from ${tasksPath}`,
 					'info'
@@ -137,7 +125,7 @@ async function parsePRD(prdPath, tasksPath, numTasks, options = {}) {
 					);
 					existingTasks = []; // Reset if read fails
 				}
-			} else if (!useForce) {
+			} else if (!force) {
 				// Not appending and not forcing overwrite
 				const overwriteError = new Error(
 					`Output file ${tasksPath} already exists. Use --force to overwrite or --append.`
@@ -164,6 +152,22 @@ async function parsePRD(prdPath, tasksPath, numTasks, options = {}) {
 			throw new Error(`Input file ${prdPath} is empty or could not be read.`);
 		}
 
+		// Check if we should auto-enable append mode for claude-code provider
+		const currentProvider = getMainProvider(projectRoot);
+		const isClaudeCode = currentProvider === 'claude-code';
+		let useAppend = append;
+		let useForce = force;
+		let tasksPerBatch = numTasks; // Start with the requested number of tasks
+		
+		if (isClaudeCode && numTasks >= 10 && !append && !force) {
+			report(
+				`Detected claude-code provider with ${numTasks} tasks. Auto-enabling batch mode with append.`,
+				'info'
+			);
+			useAppend = true;
+			tasksPerBatch = Math.min(6, numTasks); // Generate max 6 tasks per batch for claude-code
+		}
+
 		// Handle batching for claude-code provider
 		if (isClaudeCode && numTasks >= 10 && tasksPerBatch < numTasks) {
 			return await parsePRDInBatches(
@@ -180,13 +184,28 @@ async function parsePRD(prdPath, tasksPath, numTasks, options = {}) {
 					session,
 					projectRoot,
 					useForce,
-					useAppend: true // Always use append for batches after the first
+					useAppend: true, // Always use append for batches after the first
+					research
 				}
 			);
 		}
 
-		// Build system prompt for PRD parsing
-		const systemPrompt = `You are an AI assistant specialized in analyzing Product Requirements Documents (PRDs) and generating a structured, logically ordered, dependency-aware and sequenced list of development tasks in JSON format.
+		// Research-specific enhancements to the system prompt
+		const researchPromptAddition = research
+			? `\nBefore breaking down the PRD into tasks, you will:
+1. Research and analyze the latest technologies, libraries, frameworks, and best practices that would be appropriate for this project
+2. Identify any potential technical challenges, security concerns, or scalability issues not explicitly mentioned in the PRD without discarding any explicit requirements or going overboard with complexity -- always aim to provide the most direct path to implementation, avoiding over-engineering or roundabout approaches
+3. Consider current industry standards and evolving trends relevant to this project (this step aims to solve LLM hallucinations and out of date information due to training data cutoff dates)
+4. Evaluate alternative implementation approaches and recommend the most efficient path
+5. Include specific library versions, helpful APIs, and concrete implementation guidance based on your research
+6. Always aim to provide the most direct path to implementation, avoiding over-engineering or roundabout approaches
+
+Your task breakdown should incorporate this research, resulting in more detailed implementation guidance, more accurate dependency mapping, and more precise technology recommendations than would be possible from the PRD text alone, while maintaining all explicit requirements and best practices and all details and nuances of the PRD.`
+			: '';
+
+		// Base system prompt for PRD parsing
+		const systemPrompt = `You are an AI assistant specialized in analyzing Product Requirements Documents (PRDs) and generating a structured, logically ordered, dependency-aware and sequenced list of development tasks in JSON format.${researchPromptAddition}
+
 Analyze the provided PRD content and generate approximately ${tasksPerBatch} top-level development tasks. If the complexity or the level of detail of the PRD is high, generate more tasks relative to the complexity of the PRD
 Each task should represent a logical unit of work needed to implement the requirements and focus on the most direct and effective way to implement the requirements without unnecessary complexity or overengineering. Include pseudo-code, implementation details, and test strategy for each task. Find the most up to date information to implement each task.
 Assign sequential IDs starting from ${nextId}. Infer title, description, details, and test strategy for each task based *only* on the PRD content.
@@ -213,15 +232,15 @@ Guidelines:
 5. Include clear validation/testing approach for each task
 6. Set appropriate dependency IDs (a task can only depend on tasks with lower IDs, potentially including existing tasks with IDs less than ${nextId} if applicable)
 7. Assign priority (high/medium/low) based on criticality and dependency order
-8. Include detailed implementation guidance in the "details" field
+8. Include detailed implementation guidance in the "details" field${research ? ', with specific libraries and version recommendations based on your research' : ''}
 9. If the PRD contains specific requirements for libraries, database schemas, frameworks, tech stacks, or any other implementation details, STRICTLY ADHERE to these requirements in your task breakdown and do not discard them under any circumstance
 10. Focus on filling in any gaps left by the PRD or areas that aren't fully specified, while preserving all explicit requirements
-11. Always aim to provide the most direct path to implementation, avoiding over-engineering or roundabout approaches`;
+11. Always aim to provide the most direct path to implementation, avoiding over-engineering or roundabout approaches${research ? '\n12. For each task, include specific, actionable guidance based on current industry standards and best practices discovered through research' : ''}`;
 
 		// Build user prompt with PRD content
-		const userPrompt = `Here's the Product Requirements Document (PRD) to break down into approximately ${tasksPerBatch} tasks, starting IDs from ${nextId}:\n\n${prdContent}\n\n
+		const userPrompt = `Here's the Product Requirements Document (PRD) to break down into approximately ${tasksPerBatch} tasks, starting IDs from ${nextId}:${research ? '\n\nRemember to thoroughly research current best practices and technologies before task breakdown to provide specific, actionable implementation details.' : ''}\n\n${prdContent}\n\n
 
-		Return your response in this format:
+Return your response in this format:
 {
     "tasks": [
         {
@@ -241,11 +260,14 @@ Guidelines:
 }`;
 
 		// Call the unified AI service
-		report('Calling AI service to generate tasks from PRD...', 'info');
+		report(
+			`Calling AI service to generate tasks from PRD${research ? ' with research-backed analysis' : ''}...`,
+			'info'
+		);
 
 		// Call generateObjectService with the CORRECT schema and additional telemetry params
 		aiServiceResponse = await generateObjectService({
-			role: 'main',
+			role: research ? 'research' : 'main', // Use research role if flag is set
 			session: session,
 			projectRoot: projectRoot,
 			schema: prdResponseSchema,
@@ -261,7 +283,9 @@ Guidelines:
 		if (!fs.existsSync(tasksDir)) {
 			fs.mkdirSync(tasksDir, { recursive: true });
 		}
-		logFn.success('Successfully parsed PRD via AI service.\n');
+		logFn.success(
+			`Successfully parsed PRD via AI service${research ? ' with research-backed analysis' : ''}.`
+		);
 
 		// Validate and Process Tasks
 		// const generatedData = aiServiceResponse?.mainResult?.object;
@@ -323,7 +347,7 @@ Guidelines:
 				);
 		});
 
-		const finalTasks = append
+		const finalTasks = useAppend
 			? [...existingTasks, ...processedNewTasks]
 			: processedNewTasks;
 		const outputData = { tasks: finalTasks };
@@ -331,7 +355,7 @@ Guidelines:
 		// Write the final tasks to the file
 		writeJSON(tasksPath, outputData);
 		report(
-			`Successfully ${append ? 'appended' : 'generated'} ${processedNewTasks.length} tasks in ${tasksPath}`,
+			`Successfully ${useAppend ? 'appended' : 'generated'} ${processedNewTasks.length} tasks in ${tasksPath}${research ? ' with research-backed analysis' : ''}`,
 			'success'
 		);
 
@@ -343,7 +367,7 @@ Guidelines:
 			console.log(
 				boxen(
 					chalk.green(
-						`Successfully generated ${processedNewTasks.length} new tasks. Total tasks in ${tasksPath}: ${finalTasks.length}`
+						`Successfully generated ${processedNewTasks.length} new tasks${research ? ' with research-backed analysis' : ''}. Total tasks in ${tasksPath}: ${finalTasks.length}`
 					),
 					{ padding: 1, borderColor: 'green', borderStyle: 'round' }
 				)
@@ -398,7 +422,7 @@ Guidelines:
  * Parse PRD in batches for claude-code provider to avoid response truncation
  */
 async function parsePRDInBatches(prdPath, tasksPath, totalTasks, tasksPerBatch, prdContent, existingTasks, startId, options) {
-	const { reportProgress, mcpLog, session, projectRoot, useForce } = options;
+	const { reportProgress, mcpLog, session, projectRoot, useForce, research } = options;
 	const logFn = mcpLog || {
 		info: (...args) => log('info', ...args),
 		warn: (...args) => log('warn', ...args),
@@ -452,7 +476,8 @@ async function parsePRDInBatches(prdPath, tasksPath, totalTasks, tasksPerBatch, 
 				projectRoot,
 				useForce: isFirstBatch ? useForce : false,
 				useAppend: !isFirstBatch, // First batch might overwrite, rest append
-				tasksPerBatch: currentBatchSize // Pass the actual batch size
+				tasksPerBatch: currentBatchSize, // Pass the actual batch size
+				research
 			}
 		);
 
@@ -472,7 +497,7 @@ async function parsePRDInBatches(prdPath, tasksPath, totalTasks, tasksPerBatch, 
  * Single batch processing function (extracted from main parsePRD logic)
  */
 async function parsePRDSingleBatch(prdPath, tasksPath, numTasks, nextId, prdContent, existingTasks, options) {
-	const { reportProgress, mcpLog, session, projectRoot, useForce, useAppend, tasksPerBatch } = options;
+	const { reportProgress, mcpLog, session, projectRoot, useForce, useAppend, tasksPerBatch, research } = options;
 	const actualTasksPerBatch = tasksPerBatch || numTasks; // Fallback to numTasks if not provided
 	const isMCP = !!mcpLog;
 	const outputFormat = isMCP ? 'json' : 'text';
@@ -484,8 +509,21 @@ async function parsePRDSingleBatch(prdPath, tasksPath, numTasks, nextId, prdCont
 		success: (...args) => log('success', ...args)
 	};
 
+	// Research-specific enhancements to the system prompt
+	const researchPromptAddition = research
+		? `\nBefore breaking down the PRD into tasks, you will:
+1. Research and analyze the latest technologies, libraries, frameworks, and best practices that would be appropriate for this project
+2. Identify any potential technical challenges, security concerns, or scalability issues not explicitly mentioned in the PRD without discarding any explicit requirements or going overboard with complexity -- always aim to provide the most direct path to implementation, avoiding over-engineering or roundabout approaches
+3. Consider current industry standards and evolving trends relevant to this project (this step aims to solve LLM hallucinations and out of date information due to training data cutoff dates)
+4. Evaluate alternative implementation approaches and recommend the most efficient path
+5. Include specific library versions, helpful APIs, and concrete implementation guidance based on your research
+6. Always aim to provide the most direct path to implementation, avoiding over-engineering or roundabout approaches
+
+Your task breakdown should incorporate this research, resulting in more detailed implementation guidance, more accurate dependency mapping, and more precise technology recommendations than would be possible from the PRD text alone, while maintaining all explicit requirements and best practices and all details and nuances of the PRD.`
+		: '';
+
 	// Build system prompt for PRD parsing
-	const systemPrompt = `You are an AI assistant specialized in analyzing Product Requirements Documents (PRDs) and generating a structured, logically ordered, dependency-aware and sequenced list of development tasks in JSON format.
+	const systemPrompt = `You are an AI assistant specialized in analyzing Product Requirements Documents (PRDs) and generating a structured, logically ordered, dependency-aware and sequenced list of development tasks in JSON format.${researchPromptAddition}
 Analyze the provided PRD content and generate approximately ${actualTasksPerBatch} top-level development tasks. If the complexity or the level of detail of the PRD is high, generate more tasks relative to the complexity of the PRD
 Each task should represent a logical unit of work needed to implement the requirements and focus on the most direct and effective way to implement the requirements without unnecessary complexity or overengineering. Include pseudo-code, implementation details, and test strategy for each task. Find the most up to date information to implement each task.
 Assign sequential IDs starting from ${nextId}. Infer title, description, details, and test strategy for each task based *only* on the PRD content.
@@ -512,13 +550,13 @@ Guidelines:
 5. Include clear validation/testing approach for each task
 6. Set appropriate dependency IDs (a task can only depend on tasks with lower IDs, potentially including existing tasks with IDs less than ${nextId} if applicable)
 7. Assign priority (high/medium/low) based on criticality and dependency order
-8. Include detailed implementation guidance in the "details" field
+8. Include detailed implementation guidance in the "details" field${research ? ', with specific libraries and version recommendations based on your research' : ''}
 9. If the PRD contains specific requirements for libraries, database schemas, frameworks, tech stacks, or any other implementation details, STRICTLY ADHERE to these requirements in your task breakdown and do not discard them under any circumstance
 10. Focus on filling in any gaps left by the PRD or areas that aren't fully specified, while preserving all explicit requirements
-11. Always aim to provide the most direct path to implementation, avoiding over-engineering or roundabout approaches`;
+11. Always aim to provide the most direct path to implementation, avoiding over-engineering or roundabout approaches${research ? '\n12. For each task, include specific, actionable guidance based on current industry standards and best practices discovered through research' : ''}`;
 
 	// Build user prompt with PRD content
-	const userPrompt = `Here's the Product Requirements Document (PRD) to break down into approximately ${actualTasksPerBatch} tasks, starting IDs from ${nextId}:\n\n${prdContent}\n\n
+	const userPrompt = `Here's the Product Requirements Document (PRD) to break down into approximately ${actualTasksPerBatch} tasks, starting IDs from ${nextId}:${research ? '\n\nRemember to thoroughly research current best practices and technologies before task breakdown to provide specific, actionable implementation details.' : ''}\n\n${prdContent}\n\n
 
 Return your response in this format:
 {
@@ -541,7 +579,7 @@ Return your response in this format:
 
 	// Call the unified AI service
 	const aiServiceResponse = await generateObjectService({
-		role: 'main',
+		role: research ? 'research' : 'main',
 		session: session,
 		projectRoot: projectRoot,
 		schema: prdResponseSchema,
@@ -613,7 +651,7 @@ Return your response in this format:
 	// Write the final tasks to the file
 	writeJSON(tasksPath, outputData);
 	logFn.success(
-		`Successfully ${useAppend ? 'appended' : 'generated'} ${processedNewTasks.length} tasks in ${tasksPath}`
+		`Successfully ${useAppend ? 'appended' : 'generated'} ${processedNewTasks.length} tasks in ${tasksPath}${research ? ' with research-backed analysis' : ''}`
 	);
 }
 

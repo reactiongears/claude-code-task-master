@@ -14,7 +14,12 @@ import {
 	getResearchModelId,
 	getFallbackProvider,
 	getFallbackModelId,
-	getParametersForRole
+	getParametersForRole,
+	getUserId,
+	MODEL_MAP,
+	getDebugFlag,
+	getBaseUrlForRole,
+	isApiKeySet
 } from './config-manager.js';
 import { log, resolveEnvVariable, findProjectRoot } from './utils.js';
 
@@ -25,7 +30,7 @@ import * as openai from '../../src/ai-providers/openai.js';
 import * as xai from '../../src/ai-providers/xai.js';
 import * as openrouter from '../../src/ai-providers/openrouter.js';
 import * as claudeCode from '../../src/ai-providers/claude-code.js';
-// TODO: Import other provider modules when implemented (ollama, etc.)
+import * as ollama from '../../src/ai-providers/ollama.js';
 
 // --- Provider Function Map ---
 // Maps provider names (lowercase) to their respective service functions
@@ -68,8 +73,12 @@ const PROVIDER_FUNCTIONS = {
 		generateText: openrouter.generateOpenRouterText,
 		streamText: openrouter.streamOpenRouterText,
 		generateObject: openrouter.generateOpenRouterObject
+	},
+	ollama: {
+		generateText: ollama.generateOllamaText,
+		streamText: ollama.streamOllamaText,
+		generateObject: ollama.generateOllamaObject
 	}
-	// TODO: Add entries for ollama, etc. when implemented
 };
 
 // --- Configuration for Retries ---
@@ -248,6 +257,34 @@ async function _attemptProviderCallWithRetries(
 	);
 }
 
+// Helper function to get cost for a specific model
+function _getCostForModel(providerName, modelId) {
+	if (!MODEL_MAP || !MODEL_MAP[providerName]) {
+		log(
+			'warn',
+			`Provider "${providerName}" not found in MODEL_MAP. Cannot determine cost for model ${modelId}.`
+		);
+		return { inputCost: 0, outputCost: 0, currency: 'USD' }; // Default to zero cost
+	}
+
+	const modelData = MODEL_MAP[providerName].find((m) => m.id === modelId);
+	if (!modelData || !modelData.cost_per_1m_tokens) {
+		log(
+			'debug',
+			`Cost data not found for model "${modelId}" under provider "${providerName}". Assuming zero cost.`
+		);
+		return { inputCost: 0, outputCost: 0, currency: 'USD' }; // Default to zero cost
+	}
+
+	// Ensure currency is part of the returned object, defaulting if not present
+	const currency = modelData.cost_per_1m_tokens.currency || 'USD';
+	return {
+		inputCost: modelData.cost_per_1m_tokens.input || 0,
+		outputCost: modelData.cost_per_1m_tokens.output || 0,
+		currency: currency
+	};
+}
+
 /**
  * Base logic for unified service functions.
  * @param {string} serviceType - Type of service ('generateText', 'streamText', 'generateObject').
@@ -264,15 +301,21 @@ async function _unifiedServiceRunner(serviceType, params) {
 		prompt,
 		schema,
 		objectName,
+		commandName,
+		outputType,
 		...restApiParams
 	} = params;
-	log('info', `${serviceType}Service called`, {
-		role: initialRole,
-		projectRoot
-	});
+	
+	if (getDebugFlag()) {
+		log('info', `${serviceType}Service called`, {
+			role: initialRole,
+			projectRoot
+		});
+	}
 
 	// Determine the effective project root (passed in or detected)
 	const effectiveProjectRoot = projectRoot || findProjectRoot();
+	const userId = getUserId(effectiveProjectRoot);
 
 	let sequence;
 	if (initialRole === 'main') {
@@ -294,7 +337,7 @@ async function _unifiedServiceRunner(serviceType, params) {
 		'AI service call failed for all configured roles.';
 
 	for (const currentRole of sequence) {
-		let providerName, modelId, apiKey, roleParams, providerFnSet, providerApiFn;
+		let providerName, modelId, apiKey, roleParams, providerFnSet, providerApiFn, telemetryData;
 
 		try {
 			log('info', `New AI service call with role: ${currentRole}`);
@@ -333,8 +376,23 @@ async function _unifiedServiceRunner(serviceType, params) {
 				continue;
 			}
 
+			// Check if API key is set for the current provider and role (excluding 'ollama' and 'claude-code')
+			if (providerName?.toLowerCase() !== 'ollama' && providerName?.toLowerCase() !== 'claude-code') {
+				if (!isApiKeySet(providerName, session, effectiveProjectRoot)) {
+					log(
+						'warn',
+						`Skipping role '${currentRole}' (Provider: ${providerName}): API key not set or invalid.`
+					);
+					lastError =
+						lastError ||
+						new Error(`API key not configured for provider: ${providerName}`);
+					continue;
+				}
+			}
+
 			// Pass effectiveProjectRoot to getParametersForRole
 			roleParams = getParametersForRole(currentRole, effectiveProjectRoot);
+			const baseUrl = getBaseUrlForRole(currentRole, effectiveProjectRoot);
 
 			// 2. Get Provider Function Set
 			providerFnSet = PROVIDER_FUNCTIONS[providerName?.toLowerCase()];
@@ -411,6 +469,7 @@ async function _unifiedServiceRunner(serviceType, params) {
 				maxTokens: roleParams.maxTokens,
 				temperature: roleParams.temperature,
 				messages,
+				...(baseUrl && { baseURL: baseUrl }),
 				...(serviceType === 'generateObject' && { schema, objectName }),
 				...restApiParams
 			};
@@ -425,6 +484,31 @@ async function _unifiedServiceRunner(serviceType, params) {
 			);
 
 			log('info', `${serviceType}Service succeeded using role: ${currentRole}`);
+
+			// Add telemetry data if available
+			if (result && typeof result === 'object') {
+				// Calculate cost based on usage
+				const costData = _getCostForModel(providerName, modelId);
+				const usage = result.usage || {};
+				
+				const telemetryData = {
+					provider: providerName,
+					model: modelId,
+					role: currentRole,
+					commandName: commandName || 'unknown',
+					outputType: outputType || 'unknown',
+					userId: userId,
+					usage: usage,
+					cost: {
+						inputCost: (usage.promptTokens || 0) * costData.inputCost / 1000000,
+						outputCost: (usage.completionTokens || 0) * costData.outputCost / 1000000,
+						totalCost: ((usage.promptTokens || 0) * costData.inputCost + (usage.completionTokens || 0) * costData.outputCost) / 1000000,
+						currency: costData.currency
+					}
+				};
+				
+				result.telemetryData = telemetryData;
+			}
 
 			return result;
 		} catch (error) {
